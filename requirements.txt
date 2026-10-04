@@ -1,0 +1,4 @@
+flask
+python-nmap
+paramiko
+scapy
