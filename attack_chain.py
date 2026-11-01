@@ -20,15 +20,12 @@ from urllib.error import URLError
 TARGET = "10.0.100.20"
 USERNAME = "msfadmin"
 WORDLIST_FILE = "/home/kali/wordlist.txt"
-LOG_FILE = "/home/kali/attack_log.txt"
+
 
 def log(msg):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-    line = f"[{timestamp}] {msg}"
-    print(line, flush=True)
-    with open(LOG_FILE, "a") as f:
-        f.write(line + "\n")
-
+    print(f"[{timestamp}] {msg}", flush=True)
+    
 def grab_banner(ip, port, timeout=4):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -41,9 +38,9 @@ def grab_banner(ip, port, timeout=4):
         return None
 
 def stage1_recon():
-    log("=" * 60)
+    
     log("STAGE 1: RECONNAISSANCE [MITRE T1046: Service Discovery]")
-    log("=" * 60)
+    
     log(f"Initiating TCP SYN version scan against {TARGET} ...")
 
     nm = nmap.PortScanner()
@@ -79,9 +76,9 @@ def stage1_recon():
 
 def stage2_enumerate(open_ports):
     log("")
-    log("=" * 60)
+    
     log("STAGE 2: SERVICE ENUMERATION [MITRE T1592: Host Information]")
-    log("=" * 60)
+    
 
     findings = []
 
@@ -173,9 +170,9 @@ def stage2_enumerate(open_ports):
 
 def stage3_bruteforce():
     log("")
-    log("=" * 60)
+    
     log("STAGE 3: CREDENTIAL ATTACK [MITRE T1110.001: Password Guessing]")
-    log("=" * 60)
+    
 
     if not os.path.exists(WORDLIST_FILE):
         log(f"[!] Wordlist not found: {WORDLIST_FILE}")
@@ -231,9 +228,9 @@ def stage3_bruteforce():
 
 def stage4_exploit(password):
     log("")
-    log("=" * 60)
+    
     log("STAGE 4: EXPLOITATION & TRIAGE [MITRE T1059.004 & T1082]")
-    log("=" * 60)
+    
     log(f"Establishing authenticated remote shell on {TARGET} ...")
 
     try:
@@ -273,13 +270,13 @@ if __name__ == "__main__":
     if os.geteuid() != 0:
         print("[!] Run with: sudo python3 attack_chain.py")
 
-    open(LOG_FILE, "w").close()
 
-    log("=" * 60)
+
+    
     log("CYBER RANGE — AUTOMATED MULTI-STAGE ATTACK PIPELINE")
     log(f"Target : {TARGET} (Metasploitable2)")
     log(f"Origin : 10.0.100.10 (Kali Linux)")
-    log("=" * 60)
+    
     log("")
 
     ports = stage1_recon()
@@ -292,4 +289,4 @@ if __name__ == "__main__":
         log("[!] No credentials found — skipping exploitation.")
 
     log("")
-    log(f"[+] Log saved: {LOG_FILE}")
+

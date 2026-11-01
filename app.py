@@ -1,366 +1,234 @@
 #!/usr/bin/env python3
-"""
-Cyber Range Dashboard & Orchestration Server (v3)
-"""
+"""Minimal Mini Cyber Range dashboard with synthetic login-pattern demos."""
 
+import datetime
 import os
 import subprocess
+import sys
 import threading
-import datetime
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
+from detector import IntrusionDetector
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ATTACK_LOG = os.path.join(BASE_DIR, "attack_log.txt")
+DETECTION_LOG = os.path.join(BASE_DIR, "detection_log.txt")
+ATTACK_SCRIPT = os.path.join(BASE_DIR, "attack_chain.py")
+DETECTOR_SCRIPT = os.path.join(BASE_DIR, "detector.py")
 app = Flask(__name__)
+state_lock = threading.Lock()
+state = {"running": False, "mode": None, "report_ready": False, "error": None}
 
-ATTACK_LOG = "/home/kali/attack_log.txt"
-DETECTION_LOG = "/home/kali/detection_log.txt"
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini Cyber Range</title>
+<style>
+:root{--paper:#f5f5f2;--surface:#fff;--ink:#202522;--muted:#68716b;--line:#dfe3de;--accent:#256b5c;--warn:#995c13}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1120px;margin:0 auto;padding:32px 24px 56px}header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid var(--line);padding-bottom:20px;margin-bottom:24px}
+h1{font-size:24px;line-height:1.2;margin:0 0 6px;font-weight:650;letter-spacing:-.02em}.sub{color:var(--muted);font-size:13px}.status{font-size:13px;border:1px solid var(--line);background:var(--surface);padding:5px 10px;border-radius:4px;white-space:nowrap}
+section{background:var(--surface);border:1px solid var(--line);border-radius:6px;margin:16px 0;padding:18px 20px}h2{font-size:16px;margin:0 0 12px;font-weight:620}.hint{color:var(--muted);font-size:13px;margin:-4px 0 14px}
+.output-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.output-column{min-width:0}.output-column h3{font-size:13px;font-weight:600;margin:0 0 7px;color:var(--muted)}
+.controls{display:flex;gap:9px;flex-wrap:wrap}.btn{font:inherit;font-size:13px;padding:9px 13px;border:1px solid #cbd3cd;border-radius:4px;background:#fff;color:var(--ink);cursor:pointer}.btn.primary{background:var(--accent);border-color:var(--accent);color:white}.btn:hover:not(:disabled){filter:brightness(.96)}.btn:disabled{opacity:.5;cursor:wait}
+.result{border-left:3px solid var(--accent);padding:10px 13px;background:#f7faf8;margin-top:14px;font-size:13px}.result strong{font-weight:650}.result small{display:block;color:var(--muted);margin-top:3px}
+.tablewrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:600}td.time{white-space:nowrap;color:var(--muted);font-variant-numeric:tabular-nums}.tag{color:var(--accent);font-weight:600}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f7f8f6;border:1px solid var(--line);padding:12px;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;color:#303833;max-height:360px;overflow:auto;margin:0}footer{color:var(--muted);font-size:12px;padding-top:6px}
+@media(max-width:700px){main{padding:22px 14px}header{gap:12px;flex-direction:column}section{padding:15px}.output-grid{grid-template-columns:1fr}}
+</style></head><body><main>
+<header><div><h1>Mini Cyber Range</h1><div class="sub">Local training demo · Login timing is a heuristic, not identity verification</div></div><div class="status" id="status">Idle</div></header>
+<section><h2>Run a demonstration</h2><p class="hint">Login demos create event timings locally. The detector receives failures and timestamps, not the selected button name.</p>
+<div class="controls"><button class="btn primary run" data-mode="chain">Run lab attack chain</button><button class="btn run" data-mode="variable">Simulate variable timing</button><button class="btn run" data-mode="rapid">Simulate rapid, regular timing</button><button class="btn" id="clear-display">Clear display</button><button class="btn" id="report-btn" disabled>Print / Save as PDF</button></div>
+<div id="result" class="result" hidden></div></section>
+<section><h2>Run output</h2><div class="output-grid"><div class="output-column"><h3>Simulator</h3><pre id="attack-raw">—</pre></div><div class="output-column"><h3>Detector</h3><pre id="detection-raw">—</pre></div></div></section>
+<section><h2>Event timeline</h2><p class="hint">Simulator events and detector findings are separated for easier comparison.</p><div class="output-grid"><div class="output-column"><h3>Simulator events</h3><div class="tablewrap"><table><thead><tr><th>Time</th><th>Level</th><th>Event</th></tr></thead><tbody id="attack-events"><tr><td colspan="3" class="sub">No run yet.</td></tr></tbody></table></div></div><div class="output-column"><h3>Detector events</h3><div class="tablewrap"><table><thead><tr><th>Time</th><th>Level</th><th>Finding / evidence</th></tr></thead><tbody id="detection-events"><tr><td colspan="3" class="sub">No run yet.</td></tr></tbody></table></div></div></div></section>
+<footer>SSH packet observations report connection timing only. SSH authentication contents are encrypted and are not inspected.</footer>
+</main><script>
+let timer=null, active=false;
+let attackOffset=0, detectionOffset=0;
+let previousAttackCount=0, previousDetectionCount=0;
+const statusEl=document.getElementById('status');
+function parseLine(line, component){
+  const legacy=line.match(/^\[(\d{2}:\d{2}:\d{2})\] \[([^\]]+)\] \[([^\]]+)\] \[([^\]]+)\] (.*)$/);
+  if(legacy)return {time:legacy[1],level:legacy[2],component:legacy[3],text:legacy[5]};
+  const current=line.match(/^(\d{2}:\d{2}:\d{2})\s+(INFO|WARN|WARNING|ERROR|CRITICAL|HIGH)\s+(\S+)\s+(.*)$/);
+  if(!current)return {time:'',level:'INFO',component,text:line};
+  return {time:current[1],level:current[2],component:current[3],text:current[4]};
+}
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+async function refresh(){
+ const r=await fetch('/api/status'); const d=await r.json();
+ document.getElementById('report-btn').disabled=!d.report_ready;
+ const attackLines=(d.attack||'').split('\n').filter(Boolean);
+ const detectionLines=(d.detection||'').split('\n').filter(Boolean);
+ // A shorter file means a new run truncated the logs; show that run from its start.
+ if(attackLines.length<previousAttackCount) attackOffset=0;
+ if(detectionLines.length<previousDetectionCount) detectionOffset=0;
+ previousAttackCount=attackLines.length;
+ previousDetectionCount=detectionLines.length;
+ const shownAttack=attackLines.slice(attackOffset);
+ const shownDetection=detectionLines.slice(detectionOffset);
+ document.getElementById('attack-raw').textContent=shownAttack.join('\n')||'—';
+ document.getElementById('detection-raw').textContent=shownDetection.join('\n')||'—';
+ function renderEvents(targetId, lines, source){
+  const target=document.getElementById(targetId);
+  if(!lines.length){target.innerHTML='<tr><td colspan="3" class="sub">No events yet.</td></tr>';return;}
+  const entries=lines.map(x=>parseLine(x,source)).sort((a,b)=>a.time.localeCompare(b.time));
+  target.innerHTML=entries.map(x=>`<tr><td class="time">${esc(x.time)}</td><td>${esc(x.level)}</td><td>${esc(x.text)}</td></tr>`).join('');
+ }
+ renderEvents('attack-events',shownAttack,'simulator');
+ renderEvents('detection-events',shownDetection,'detector');
+ if(!d.running&&active){active=false;clearInterval(timer);timer=null;document.querySelectorAll('.run').forEach(b=>b.disabled=false);statusEl.textContent='Complete';}
+}
+async function start(mode){if(active)return;active=true;attackOffset=0;detectionOffset=0;previousAttackCount=0;previousDetectionCount=0;document.querySelectorAll('.run').forEach(b=>b.disabled=true);document.getElementById('report-btn').disabled=true;statusEl.textContent='Running';document.getElementById('result').hidden=true;
+ try{const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})});const d=await r.json();if(!r.ok)throw new Error(d.error||'Could not start');await refresh();if(active)timer=setInterval(refresh,500);}catch(e){active=false;document.querySelectorAll('.run').forEach(b=>b.disabled=false);statusEl.textContent='Error';alert(e.message);}}
+document.querySelectorAll('.run').forEach(b=>b.addEventListener('click',()=>start(b.dataset.mode)));
+document.getElementById('report-btn').addEventListener('click',()=>{window.open('/report','_blank');});
+document.getElementById('clear-display').addEventListener('click',()=>{
+ attackOffset=previousAttackCount;
+ detectionOffset=previousDetectionCount;
+ document.getElementById('attack-raw').textContent='—';
+ document.getElementById('detection-raw').textContent='—';
+ document.getElementById('attack-events').innerHTML='<tr><td colspan="3" class="sub">Display cleared. New events will appear here.</td></tr>';
+ document.getElementById('detection-events').innerHTML='<tr><td colspan="3" class="sub">Display cleared. New events will appear here.</td></tr>';
+});
+refresh();
+</script></body></html>"""
 
-is_running = False
 
-HTML_PAGE = r"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cyber Range — Attack & Detection Platform</title>
-    <style>
-        :root {
-            --bg-base: #0a0d14; --bg-surface: #121824; --border: #1e293b;
-            --text-main: #f1f5f9; --text-muted: #94a3b8;
-            --attack: #f43f5e; --attack-bg: #88133722;
-            --defense: #38bdf8; --defense-bg: #0369a122;
-        }
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; }
-        body { background: var(--bg-base); color: var(--text-main); min-height: 100vh; padding: 20px; }
+def write_line(path, level, component, message):
+    stamp = datetime.datetime.now().strftime("%H:%M:%S")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{stamp} {level:<5} {component:<28} {message}\n")
 
-        header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 16px; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
-        .header-title h1 { font-size: 22px; font-weight: 700; }
-        .header-title p { color: var(--text-muted); font-size: 13px; margin-top: 4px; }
-        .badge-live { padding: 4px 10px; border-radius: 9999px; font-size: 12px; font-weight: 600; background: #065f46; color: #6ee7b7; border: 1px solid #10b981; }
 
-        .controls { display: flex; gap: 14px; align-items: center; background: var(--bg-surface); padding: 14px 18px; border-radius: 10px; border: 1px solid var(--border); margin-bottom: 20px; }
-        .btn { padding: 10px 22px; border-radius: 8px; font-weight: 600; font-size: 14px; cursor: pointer; border: none; transition: 0.2s all; display: flex; align-items: center; gap: 8px; }
-        .btn-launch { background: var(--attack); color: white; }
-        .btn-launch:hover:not(:disabled) { background: #e11d48; transform: translateY(-1px); }
-        .btn-launch:disabled { opacity: 0.5; cursor: not-allowed; }
-        .btn-report { background: #1e293b; color: var(--text-main); border: 1px solid var(--border); }
-        .btn-report:hover:not(.btn-disabled) { background: #334155; }
-        .btn-disabled { opacity: 0.35; cursor: not-allowed !important; pointer-events: none; }
-        .status-indicator { font-size: 13px; color: var(--text-muted); margin-left: auto; }
+def run_worker(mode):
+    detector_proc = None
+    try:
+        if mode == "chain" and os.geteuid() != 0:
+            raise RuntimeError(
+                "Packet capture needs elevated privileges. Stop Flask and start it with: sudo python3 app.py"
+            )
 
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
-        .panel { background: var(--bg-surface); border-radius: 10px; border: 1px solid var(--border); display: flex; flex-direction: column; height: 480px; overflow: hidden; }
-        .panel-header { padding: 12px 18px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); font-weight: 700; font-size: 14px; }
-        .panel-attack .panel-header { background: var(--attack-bg); color: var(--attack); }
-        .panel-detection .panel-header { background: var(--defense-bg); color: var(--defense); }
-        .log-box { flex: 1; padding: 14px; overflow-y: auto; font-size: 12px; line-height: 1.6; background: #090c12; font-family: monospace; white-space: pre-wrap; word-break: break-word; }
-        .log-attack { color: #fecdd3; }
-        .log-detection { color: #bae6fd; }
+        open(ATTACK_LOG, "w", encoding="utf-8").close()
+        open(DETECTION_LOG, "w", encoding="utf-8").close()
 
-        .timeline-section { background: var(--bg-surface); border-radius: 10px; border: 1px solid var(--border); padding: 16px; margin-bottom: 20px; }
-        .timeline-section h2 { font-size: 15px; margin-bottom: 12px; }
-        .timeline-list { max-height: 250px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
-        .timeline-item { display: flex; gap: 12px; font-size: 12px; padding: 8px 12px; border-radius: 6px; background: #090c12; border-left: 3px solid var(--border); }
-        .timeline-item.attack { border-left-color: var(--attack); }
-        .timeline-item.defense { border-left-color: var(--defense); }
-        .timeline-time { color: var(--text-muted); min-width: 65px; }
-        .timeline-tag { font-weight: 700; min-width: 80px; text-transform: uppercase; font-size: 11px; }
-        .timeline-tag.attack { color: var(--attack); }
-        .timeline-tag.defense { color: var(--defense); }
-    </style>
-</head>
-<body>
-    <header>
-        <div class="header-title">
-            <h1>🛡️ Two-Sided Cyber Range Platform</h1>
-            <p>Automated Attack Simulation & Real-Time Traffic Detection • Target: 10.0.100.20 • Attacker: 10.0.100.10</p>
-        </div>
-        <span class="badge-live">● Range Active</span>
-    </header>
+        if mode == "chain":
+            # Start passive monitoring before the chain so its first packets are observed.
+            detector_proc = subprocess.Popen(
+                [sys.executable, DETECTOR_SCRIPT],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            threading.Event().wait(1.0)
+            if detector_proc.poll() is not None:
+                detail = detector_proc.stderr.read().strip() if detector_proc.stderr else ""
+                raise RuntimeError("Detector failed to start" + (f": {detail}" if detail else ". Check Scapy and the interface."))
 
-    <div class="controls">
-        <button id="launch-btn" class="btn btn-launch" onclick="launchChain()">🚀 Launch Attack Chain</button>
-        <button id="report-btn" class="btn btn-report btn-disabled" onclick="openReport()">📄 View Incident Report</button>
-        <span id="status-text" class="status-indicator">Ready to execute.</span>
-    </div>
+            proc = subprocess.Popen(
+                [sys.executable, ATTACK_SCRIPT],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            for line in proc.stdout:
+                write_line(ATTACK_LOG, "INFO", "attack-chain", line.strip())
+            code = proc.wait()
+            if code:
+                raise RuntimeError(f"attack chain exited with status {code}")
+        else:
+            detector = IntrusionDetector()
+            delays = [0.8, 2.5, 1.1, 3.0, 1.6, 2.8] if mode == "variable" else [0.35] * 7
+            write_line(ATTACK_LOG, "INFO", "simulator", f"starting {mode}-timing login event stream")
+            for delay in delays:
+                threading.Event().wait(delay)
+                detector.process_login_event("demo_user", "login_failed")
+                write_line(ATTACK_LOG, "INFO", "event", "login_failed user=demo_user")
+            if mode == "variable":
+                detector.process_login_event("demo_user", "password_reset_requested")
+                write_line(ATTACK_LOG, "INFO", "event", "password_reset_requested user=demo_user")
+            write_line(ATTACK_LOG, "INFO", "simulator", "event stream complete")
+    except Exception as exc:
+        with state_lock:
+            state["error"] = str(exc)
+        write_line(ATTACK_LOG, "ERROR", "runner", str(exc))
+    finally:
+        if detector_proc is not None and detector_proc.poll() is None:
+            detector_proc.terminate()
+            try:
+                detector_proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                detector_proc.kill()
+                detector_proc.wait()
+        with state_lock:
+            state["running"] = False
+            state["report_ready"] = state["error"] is None
 
-    <div class="grid">
-        <div class="panel panel-attack">
-            <div class="panel-header">
-                <span>⚔️ ATTACK ENGINE (Recon → Enum → Brute Force → Shell)</span>
-                <span id="attack-count" style="font-size:11px;opacity:.8;">0 events</span>
-            </div>
-            <div id="attack-log" class="log-box log-attack">Waiting for attack sequence...</div>
-        </div>
-        <div class="panel panel-detection">
-            <div class="panel-header">
-                <span>🛡️ DETECTION ENGINE (Scapy Packet Sniffer)</span>
-                <span id="detection-count" style="font-size:11px;opacity:.8;">0 alerts</span>
-            </div>
-            <div id="detection-log" class="log-box log-detection">Passive sniffer idle...</div>
-        </div>
-    </div>
-
-    <div class="timeline-section">
-        <h2>⏱️ Unified Attack-to-Detection Timeline</h2>
-        <div id="timeline" class="timeline-list">
-            <div style="color:var(--text-muted);font-size:12px;">Launch an attack to see the correlated timeline.</div>
-        </div>
-    </div>
-
-    <script>
-        let pollingInterval = null;
-        let chainRunning = false;
-        let chainFinished = false;
-
-        function openReport() {
-            if (!chainFinished) return;
-            window.open('/report', '_blank');
-        }
-
-        function launchChain() {
-            if (chainRunning) return;
-            chainRunning = true;
-            chainFinished = false;
-
-            const btn = document.getElementById('launch-btn');
-            const reportBtn = document.getElementById('report-btn');
-            btn.disabled = true;
-            btn.innerHTML = '⏳ Executing Sequence...';
-            document.getElementById('status-text').textContent = 'Attack chain running...';
-            reportBtn.classList.add('btn-disabled');
-
-            fetch('/api/launch', { method: 'POST' }).then(r => r.json()).then(() => { startPolling(); });
-        }
-
-        function startPolling() {
-            if (pollingInterval) clearInterval(pollingInterval);
-            pollingInterval = setInterval(updateLogs, 1000);
-        }
-
-        function updateLogs() {
-            fetch('/api/status').then(r => r.json()).then(data => {
-                const attackBox = document.getElementById('attack-log');
-                const detectionBox = document.getElementById('detection-log');
-                const timeline = document.getElementById('timeline');
-
-                if (data.attack_text) {
-                    attackBox.textContent = data.attack_text;
-                    attackBox.scrollTop = attackBox.scrollHeight;
-                    document.getElementById('attack-count').textContent = data.attack_lines + ' events';
-                }
-                if (data.detection_text) {
-                    detectionBox.textContent = data.detection_text;
-                    detectionBox.scrollTop = detectionBox.scrollHeight;
-                    document.getElementById('detection-count').textContent = data.detection_lines + ' alerts';
-                }
-
-                if (data.timeline && data.timeline.length > 0) {
-                    timeline.innerHTML = '';
-                    data.timeline.forEach(item => {
-                        const row = document.createElement('div');
-                        row.className = 'timeline-item ' + (item.source === 'ATTACK' ? 'attack' : 'defense');
-                        row.innerHTML = '<span class="timeline-time">' + item.time + '</span>'
-                            + '<span class="timeline-tag ' + (item.source === 'ATTACK' ? 'attack' : 'defense') + '">[' + item.source + ']</span>'
-                            + '<span>' + item.text + '</span>';
-                        timeline.appendChild(row);
-                    });
-                    timeline.scrollTop = timeline.scrollHeight;
-                }
-
-                if (!data.is_running && data.has_run) {
-                    chainRunning = false;
-                    chainFinished = true;
-                    document.getElementById('launch-btn').disabled = false;
-                    document.getElementById('launch-btn').innerHTML = '🚀 Launch Attack Chain';
-                    document.getElementById('status-text').textContent = 'Complete. Incident report ready.';
-                    document.getElementById('report-btn').classList.remove('btn-disabled');
-                    clearInterval(pollingInterval);
-                }
-            });
-        }
-
-        updateLogs();
-    </script>
-</body>
-</html>
-"""
-
-REPORT_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Incident Report — Cyber Range</title>
-    <style>
-        body { font-family: "Segoe UI", Arial, sans-serif; margin: 40px 50px; color: #1e293b; line-height: 1.5; font-size: 13px; }
-        h1 { font-size: 22px; border-bottom: 3px solid #f43f5e; padding-bottom: 8px; margin-bottom: 6px; }
-        .subtitle { color: #64748b; font-size: 12px; margin-bottom: 24px; }
-        h2 { font-size: 15px; margin-top: 28px; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; color: #0f172a; }
-        table { width: 100%; border-collapse: collapse; margin-top: 8px; }
-        th, td { border: 1px solid #cbd5e1; padding: 6px 10px; text-align: left; font-size: 12px; }
-        th { background: #f1f5f9; font-weight: 600; }
-        .sev-crit { background: #fee2e2; color: #991b1b; font-weight: 700; font-size: 11px; padding: 2px 6px; border-radius: 3px; }
-        .sev-high { background: #fef3c7; color: #92400e; font-weight: 700; font-size: 11px; padding: 2px 6px; border-radius: 3px; }
-        .sev-info { background: #e0f2fe; color: #075985; font-weight: 700; font-size: 11px; padding: 2px 6px; border-radius: 3px; }
-        .sev-warn { background: #fef9c3; color: #854d0e; font-weight: 700; font-size: 11px; padding: 2px 6px; border-radius: 3px; }
-        .finding { background: #fef2f2; border-left: 3px solid #f43f5e; padding: 8px 12px; margin: 6px 0; font-size: 12px; }
-        .remediation { background: #f0fdf4; border-left: 3px solid #22c55e; padding: 8px 12px; margin: 6px 0; font-size: 12px; }
-        .footer { margin-top: 30px; font-size: 10px; color: #94a3b8; border-top: 1px solid #e2e8f0; padding-top: 8px; }
-        @media print { body { margin: 20px; } }
-    </style>
-</head>
-<body>
-    <h1>Post-Incident Summary Report</h1>
-    <div class="subtitle">
-        Generated: {{ timestamp }} | Environment: Isolated Virtual Lab (VirtualBox Internal Network)<br>
-        Attacker: 10.0.100.10 (Kali Linux) | Target: 10.0.100.20 (Metasploitable2)
-    </div>
-
-    <h2>1. Executive Summary</h2>
-    <table>
-        <tr><th style="width:200px">Engagement Result</th><td style="color:#dc2626;font-weight:700">TARGET COMPROMISED</td></tr>
-        <tr><th>Attack Stages Executed</th><td>{{ attack_lines }} logged events across 4 stages</td></tr>
-        <tr><th>Defensive Alerts Raised</th><td>{{ detection_count }} alerts from passive NIDS</td></tr>
-        <tr><th>Time to Detection</th><td>First alert triggered within seconds of attack initiation</td></tr>
-    </table>
-
-    <h2>2. Kill Chain Progression (MITRE ATT&CK Mapped)</h2>
-    <table>
-        <tr><th>Stage</th><th>MITRE ID</th><th>Technique</th><th>Tool</th><th>Result</th></tr>
-        <tr><td>1. Reconnaissance</td><td>T1046</td><td>Network Service Discovery</td><td>Nmap (SYN + Version)</td><td>23 open ports identified</td></tr>
-        <tr><td>2. Enumeration</td><td>T1592</td><td>Gather Host Information</td><td>HTTP/FTP/Telnet Probes</td><td>Vulnerable web apps, FTP access, backdoor found</td></tr>
-        <tr><td>3. Credential Attack</td><td>T1110.001</td><td>Password Guessing</td><td>Paramiko (SSH Dict.)</td><td>Valid credential recovered</td></tr>
-        <tr><td>4. Exploitation</td><td>T1059.004</td><td>Unix Shell Execution</td><td>SSH Remote Shell</td><td>Interactive shell obtained</td></tr>
-        <tr><td>4. Triage</td><td>T1082</td><td>System Info Discovery</td><td>Shell Commands</td><td>OS, users, network data exfiltrated</td></tr>
-    </table>
-
-    <h2>3. Intrusion Detection Alerts</h2>
-    <table>
-        <tr><th style="width:70px">Time</th><th style="width:80px">Severity</th><th>Category</th><th>Details</th></tr>
-        {% for a in alerts %}
-        <tr>
-            <td>{{ a.time }}</td>
-            <td><span class="{{ a.sev_class }}">{{ a.severity }}</span></td>
-            <td>{{ a.category }}</td>
-            <td>{{ a.msg }}</td>
-        </tr>
-        {% endfor %}
-    </table>
-
-    <h2>4. Key Findings</h2>
-    <div class="finding"><strong>Critical:</strong> SSH credentials (msfadmin:msfadmin) discovered via dictionary attack — weak, default password in use.</div>
-    <div class="finding"><strong>Critical:</strong> Open backdoor shell on port 1524 provides unauthenticated root access.</div>
-    <div class="finding"><strong>High:</strong> FTP service running vsftpd 2.3.4 — known backdoor vulnerability (CVE-2011-2523).</div>
-    <div class="finding"><strong>High:</strong> 23 network services publicly exposed, many running outdated, vulnerable versions.</div>
-    <div class="finding"><strong>Medium:</strong> HTTP server exposes phpMyAdmin, Mutillidae, DVWA — all contain exploitable vulnerabilities.</div>
-    <div class="finding"><strong>Info:</strong> System runs Linux kernel 2.6.24 (2008) — end-of-life, no security patches available.</div>
-
-    <h2>5. Remediation & Hardening Recommendations</h2>
-    <div class="remediation"><strong>R1 — Enforce Strong Authentication:</strong> Disable password-based SSH login. Enforce Ed25519 key-based authentication only. Set <code>PasswordAuthentication no</code> and <code>PermitRootLogin no</code> in <code>/etc/ssh/sshd_config</code>.</div>
-    <div class="remediation"><strong>R2 — Deploy Brute-Force Protection:</strong> Install <code>fail2ban</code> to automatically block IPs after 5 failed SSH login attempts within 10 minutes. Configure <code>MaxStartups 3:50:10</code> in sshd_config to throttle concurrent unauthenticated connections.</div>
-    <div class="remediation"><strong>R3 — Eliminate Backdoors & Unnecessary Services:</strong> Remove or disable backdoor shell (port 1524), Telnet (23), rexec/rlogin/rsh (512-514), and any service not required for production. Upgrade vsftpd to a patched version or disable FTP entirely in favor of SFTP.</div>
-    <div class="remediation"><strong>R4 — Patch & Upgrade Software:</strong> Upgrade the operating system from Ubuntu 8.04 (kernel 2.6.24, EOL since 2013) to a currently supported LTS release. Update all services (Apache, MySQL, PostgreSQL, OpenSSH, ProFTPD) to current stable versions.</div>
-    <div class="remediation"><strong>R5 — Network Segmentation & Firewall Rules:</strong> Implement host-based firewall (iptables/nftables) to allow only required ports. Segment the network so database services (MySQL 3306, PostgreSQL 5432) are not directly reachable from untrusted subnets.</div>
-    <div class="remediation"><strong>R6 — Deploy Network Intrusion Detection:</strong> Install a production NIDS (Suricata or Snort) with updated rulesets to detect port scans, brute-force attacks, and exploit traffic in real time. Forward alerts to a centralized SIEM for correlation and incident response.</div>
-    <div class="remediation"><strong>R7 — Remove Vulnerable Web Applications:</strong> Uninstall intentionally vulnerable apps (DVWA, Mutillidae, TWiki). Restrict phpMyAdmin access to localhost only or replace with CLI-only database management.</div>
-
-    <div class="footer">
-        Cyber Range Platform — Automated Penetration Test & Intrusion Detection Report<br>
-        This assessment was conducted in an isolated virtual lab environment for educational purposes only.
-    </div>
-</body>
-</html>
-"""
-
-def execute_attack_and_detection():
-    global is_running
-    is_running = True
-    det_proc = subprocess.Popen(["sudo", "python3", "/home/kali/detector.py"])
-    threading.Event().wait(2.0)
-    subprocess.run(["sudo", "python3", "/home/kali/attack_chain.py"])
-    threading.Event().wait(2.0)
-    det_proc.terminate()
-    is_running = False
-
-@app.route("/")
+@app.get("/")
 def index():
-    return render_template_string(HTML_PAGE)
+    return render_template_string(PAGE)
 
-@app.route("/api/launch", methods=["POST"])
-def api_launch():
-    global is_running
-    if not is_running:
-        threading.Thread(target=execute_attack_and_detection, daemon=True).start()
-        return jsonify({"status": "started"})
-    return jsonify({"status": "already_running"})
 
-@app.route("/api/status")
+@app.post("/api/run")
+def api_run():
+    payload = request.get_json(silent=True) or {}
+    mode = payload.get("mode")
+    if mode not in {"chain", "variable", "rapid"}:
+        return jsonify({"error": "Unknown run mode"}), 400
+    with state_lock:
+        if state["running"]:
+            return jsonify({"error": "A run is already active"}), 409
+        state.update(running=True, mode=mode, report_ready=False, error=None)
+    threading.Thread(target=run_worker, args=(mode,), daemon=True).start()
+    return jsonify({"status": "started"})
+
+
+@app.get("/api/status")
 def api_status():
-    attack_text = ""
-    detection_text = ""
-    timeline = []
+    def read(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            return ""
+    with state_lock:
+        running = state["running"]
+        error = state["error"]
+        report_ready = state["report_ready"]
+        mode = state["mode"]
+    return jsonify({"running": running, "error": error, "report_ready": report_ready, "mode": mode, "attack": read(ATTACK_LOG), "detection": read(DETECTION_LOG)})
 
-    if os.path.exists(ATTACK_LOG):
-        with open(ATTACK_LOG, "r") as f:
-            attack_text = f.read()
-    if os.path.exists(DETECTION_LOG):
-        with open(DETECTION_LOG, "r") as f:
-            detection_text = f.read()
 
-    for line in attack_text.splitlines():
-        if line.startswith("[") and "]" in line:
-            timeline.append({"time": line[1:9], "source": "ATTACK", "text": line[11:]})
-    for line in detection_text.splitlines():
-        if line.startswith("[") and "]" in line:
-            timeline.append({"time": line[1:9], "source": "DEFENSE", "text": line[11:]})
-    timeline.sort(key=lambda x: x["time"])
-
-    return jsonify({
-        "is_running": is_running,
-        "has_run": len(attack_text) > 0,
-        "attack_text": attack_text,
-        "attack_lines": len(attack_text.splitlines()),
-        "detection_text": detection_text,
-        "detection_lines": len(detection_text.splitlines()),
-        "timeline": timeline
-    })
-
-@app.route("/report")
+@app.get("/report")
 def report():
-    attack_text = ""
-    alerts = []
-
-    if os.path.exists(ATTACK_LOG):
-        with open(ATTACK_LOG, "r") as f:
-            attack_text = f.read()
-
-    if os.path.exists(DETECTION_LOG):
-        with open(DETECTION_LOG, "r") as f:
-            for line in f.read().splitlines():
-                if not line.startswith("["):
-                    continue
-                parts = line.split("] [")
-                if len(parts) >= 4:
-                    time_str = parts[0].strip("[")
-                    sev = parts[1]
-                    cat = parts[2]
-                    msg = "] [".join(parts[3:]).rstrip("]")
-                    sev_map = {"CRITICAL": "sev-crit", "HIGH": "sev-high", "WARNING": "sev-warn"}
-                    alerts.append({
-                        "time": time_str, "severity": sev,
-                        "sev_class": sev_map.get(sev, "sev-info"),
-                        "category": cat, "msg": msg
-                    })
-
+    with state_lock:
+        if not state["report_ready"]:
+            return "No completed operation is available to report yet.", 409
+        mode = state["mode"] or "operation"
+    def read_log(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read() or "No events recorded."
+        except FileNotFoundError:
+            return "No events recorded."
+    report_template = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Mini Cyber Range report</title>
+<style>
+body{font:14px/1.5 Arial,sans-serif;color:#202522;margin:32px auto;max-width:900px;padding:0 24px}h1{font-size:22px;margin-bottom:4px}h2{font-size:16px;border-bottom:1px solid #dfe3de;padding-bottom:6px;margin-top:24px}.meta{color:#68716b;font-size:12px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f7f8f6;border:1px solid #dfe3de;padding:12px;font:11px/1.5 monospace}.no-print{margin:12px 0;padding:8px 12px}@media print{body{margin:0 auto;padding:0 8mm}.no-print{display:none}pre{break-inside:avoid}}
+</style></head><body><button class="no-print" onclick="window.print()">Print / Save as PDF</button>
+<h1>Mini Cyber Range — Operation Report</h1>
+<div class="meta">Generated: {{ timestamp }} · Run type: {{ mode }} · Times use the Kali system timezone.</div>
+<h2>Simulator output</h2><pre>{{ attack }}</pre>
+<h2>Detector output</h2><pre>{{ detection }}</pre>
+</body></html>"""
     return render_template_string(
-        REPORT_TEMPLATE,
+        report_template,
         timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        attack_lines=len(attack_text.splitlines()),
-        detection_count=len(alerts),
-        alerts=alerts
+        mode=mode,
+        attack=read_log(ATTACK_LOG),
+        detection=read_log(DETECTION_LOG),
     )
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
 
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=False)
