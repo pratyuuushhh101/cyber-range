@@ -73,7 +73,7 @@ These are rule-based indicators, not proof of malicious intent. A SYN is a conne
 
 ### Optional login-timing demonstrations
 
-If enabled in the dashboard, the variable-timing and rapid-timing demos send synthetic `login_failed` events to the detector's event-handling method. The timing heuristic classifies the event sequence as *human-like timing* or *automation-like timing*. These labels describe timing patterns in the generated demo events; they are not identity verification and are not derived from SSH packet contents.
+The timing heuristic classifies the event sequence as *human-like timing* or *automation-like timing*. These labels describe timing patterns in the generated demo events.
 
 ## MITRE ATT&CK references
 
@@ -88,34 +88,15 @@ These mappings describe behaviors demonstrated by the attack chain. They do not 
 
 The project's Stage 2 service-enumeration label should be reviewed before assigning T1592. A technique mapping should be supported by the specific behavior performed, not copied solely from a code comment.
 
-## Lab environment and safety
-
-- Use Kali Linux and Metasploitable2 in VirtualBox.
-- Connect both VMs to the same **Internal Network**.
-- Keep Metasploitable2 isolated from public, campus, and production networks.
-- Confirm the configured interface names and IP addresses before a run.
-- Use the project only in a lab you own or are explicitly authorized to test.
-- Do not expose the deliberately vulnerable target through a bridged adapter.
-- Treat logs and exported reports as sensitive if they contain account names, credentials, or internal network details.
-
 ## Requirements and setup
 
 The project uses Python and the packages listed in `requirements.txt`. The lab also requires Nmap to be installed on Kali. Scapy packet capture may require elevated privileges and the correct interface selection.
 
-Follow the course or repository setup instructions for installing dependencies and starting the dashboard. Before starting a lab run, verify the VM network is isolated and that the configured target address is the intended Metasploitable2 instance.
 
 ## Logs and report
 
 The dashboard keeps attack-chain output and detector findings in separate logs and displays them separately. Its print/report view formats the available operation logs for printing or saving as PDF. It should be described as a **log report**, not as an automated incident analysis or remediation system unless those features are implemented in the submitted code.
 
-## Limitations
-
-- The detector uses packet metadata and simple thresholds; its alerts can be incomplete or produce false positives.
-- SSH encryption prevents packet-level inspection of authentication outcomes and command contents.
-- The attack chain and detector provide different evidence; their outputs should not be conflated.
-- The login-timing demo uses synthetic events and does not establish a real user's identity.
-- No precision, recall, false-positive rate, or detection-latency result is claimed without a labelled dataset and measured evaluation runs.
-- This prototype is for instruction and demonstration, not production network monitoring.
 
 ## Technology stack
 
