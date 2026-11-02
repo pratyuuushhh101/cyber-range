@@ -1,66 +1,122 @@
-# Two-Sided Cyber Range Platform
+# Mini Cyber Range: Attack Simulation and Detection Dashboard
 
-An integrated cybersecurity training environment that executes an automated multi-stage attack chain against a deliberately vulnerable target and detects each stage in real time using passive network traffic analysis.
+A small educational cyber-range project for observing how selected lab activity appears in attack-side logs and passive network telemetry. The project connects a Python attack-chain script, a Scapy-based detector, and a Flask dashboard in an isolated virtual lab.
+
+This is a teaching prototype. It is not a production NIDS, a general-purpose security scanner, or a validated method for identifying every attack or successful login.
 
 ## Architecture
 
-    Host Machine (Dashboard + Browser)
-            |
-       vboxnet0 / Internal Network (10.0.100.0/24)
-            |
-      +-------------+        +----------------+
-      |   Kali VM   |        | Metasploitable2|
-      | 10.0.100.10 |<------>|  10.0.100.20   |
-      |  (Attacker) |        |   (Target)     |
-      +-------------+        +----------------+
+```mermaid
+flowchart TB
+    Browser["Browser on host"]
+    App["Flask dashboard<br/>app.py — Kali VM"]
+    Chain["Attack chain<br/>attack_chain.py"]
+    Detector["Passive packet detector<br/>detector.py"]
+    Target["Metasploitable2<br/>10.0.100.20"]
+
+    Browser <-->|"Dashboard and status"| App
+    App -->|"Starts and reads output"| Chain
+    App -->|"Starts and reads alerts"| Detector
+    Chain <-->|"Lab network activity"| Target
+    Detector -.->|"Observes TCP metadata"| Target
+    Detector -->|"Detection log"| App
+    Chain -->|"Attack log"| App
+```
+
+The Kali VM and Metasploitable2 VM should be connected through the same isolated VirtualBox internal network. Example lab addresses are Kali `10.0.100.10` and Metasploitable2 `10.0.100.20`; use the addresses configured in your environment.
 
 ## Components
 
-| Component | File | Description |
-|-----------|------|-------------|
-| Attack Engine | attack_chain.py | Automated 4-stage attack: Nmap recon, service enumeration, SSH brute-force, post-exploitation triage |
-| Detection Engine | detector.py | Scapy-based passive NIDS that sniffs packets and flags port scans, brute-force attempts, and active compromise |
-| Dashboard | app.py | Flask web server with live dual-panel dashboard, one-click orchestration, unified timeline, and incident report |
-| Credential Dictionary | wordlist.txt | Curated 50-entry password list for brute-force demonstration |
+| Component | File | Role |
+|---|---|---|
+| Dashboard and orchestration | `app.py` | Serves the Flask page, starts the lab components, reads their logs, and presents the run output. |
+| Attack chain | `attack_chain.py` | Performs the configured lab workflow using Nmap for discovery and Paramiko for SSH interactions. |
+| Packet detector | `detector.py` | Uses Scapy to observe TCP packet metadata and report selected traffic patterns. |
+| Attack log | `attack_log.txt` | Stores output from the attack-chain process as captured by the dashboard. |
+| Detection log | `detection_log.txt` | Stores messages produced by the detector. |
 
-## MITRE ATT&CK Coverage
+The attack chain uses **Nmap and Paramiko**. The target is **Metasploitable2**. The code described here does not invoke the Metasploit Framework.
 
-| Technique ID | Name | Attack Stage |
-|-------------|------|-------------|
-| T1046 | Network Service Discovery | Stage 1: Reconnaissance |
-| T1592 | Gather Victim Host Information | Stage 2: Service Enumeration |
-| T1110.001 | Password Guessing | Stage 3: Credential Attack |
-| T1059.004 | Unix Shell Execution | Stage 4: Exploitation |
-| T1082 | System Information Discovery | Stage 4: Post-Exploitation Triage |
+## Demonstration workflow
 
-## Lab Setup
+1. The user starts a run from the dashboard.
+2. For a lab-chain run, the dashboard starts the detector before starting the attack-chain process.
+3. The attack chain performs its configured stages against the lab target and prints progress.
+4. The dashboard captures that output and displays it in the attack panel.
+5. The detector observes packets on its configured interface and writes findings to the detection log.
+6. The dashboard displays the detector output separately from the attack-chain output.
+7. The report view presents the logs in a printable format that can be saved as a PDF.
 
-### Prerequisites
-- VirtualBox 7.x
-- Kali Linux VM (2024+)
-- Metasploitable2 VM
+The two output panels show different evidence sources. The attack chain can report results it receives directly from a service. The packet detector reports patterns visible in network traffic.
 
-### Network Configuration
-1. Set both VMs to Internal Network named "cyberrange"
-2. Assign static IPs:
-   - Kali: sudo ip addr add 10.0.100.10/24 dev eth0
-   - Metasploitable2: sudo ifconfig eth0 10.0.100.20 netmask 255.255.255.0 up
-3. Add a second NAT adapter to Kali for internet/pip access
+## Attack-chain stages
 
-### Installation (on Kali)
-    sudo pip3 install -r requirements.txt --break-system-packages
+The chain is intended to demonstrate these activities in the isolated lab:
 
-### Running
-    sudo python3 app.py
+1. **Reconnaissance:** Nmap identifies selected open ports and service information on the configured target.
+2. **Service enumeration:** the script performs follow-up checks on selected services and records observations such as banners or HTTP responses.
+3. **SSH authentication demonstration:** Paramiko receives the SSH server’s authentication response. The chain can therefore log whether an attempted authentication was rejected or accepted.
+4. **Post-login triage:** after successful SSH authentication, the chain requests basic system information and logs the returned output.
 
-Open http://localhost:5000 in a browser and click Launch Attack Chain.
+The chain's authentication result is separate from the detector's packet observations. Do not interpret a detector SSH alert as proof that a password failed or succeeded.
 
-## Deliverables
-- Automated multi-stage attack chain runnable on demand
-- Real-time passive NIDS detecting and classifying each attack stage
-- Unified dashboard displaying attack and detection feeds side-by-side
-- Auto-generated incident report with MITRE mapping and remediation recommendations
+## Detection behavior
 
-## Tech Stack
-Python, Flask, Nmap (python-nmap), Paramiko, Scapy, HTML/CSS/JavaScript, VirtualBox, Kali Linux, Metasploitable2
+The detector uses Scapy to inspect packet metadata such as IP addresses, ports, TCP flags, and whether a TCP packet carries payload. Its current rules include:
 
+- **Connection probe:** logs selected TCP SYN observations and labels destination ports using a static service-name map.
+- **Port-scan pattern:** reports a source/destination pair when the configured number of distinct ports is observed inside the configured time window.
+- **SSH connection burst:** reports repeated SYN packets directed to TCP port 22 within its configured window.
+- **SSH payload activity:** notes that traffic involving SSH carried payload. SSH contents remain encrypted and are not inspected.
+
+These are rule-based indicators, not proof of malicious intent. A SYN is a connection-attempt signal; it does not prove a connection completed. The detector cannot determine from encrypted SSH packets alone whether authentication succeeded, whether a password was submitted, or what commands were sent.
+
+### Optional login-timing demonstrations
+
+If enabled in the dashboard, the variable-timing and rapid-timing demos send synthetic `login_failed` events to the detector's event-handling method. The timing heuristic classifies the event sequence as *human-like timing* or *automation-like timing*. These labels describe timing patterns in the generated demo events; they are not identity verification and are not derived from SSH packet contents.
+
+## MITRE ATT&CK references
+
+These mappings describe behaviors demonstrated by the attack chain. They do not mean the detector independently confirms every technique.
+
+| Technique ID | Name | Project context |
+|---|---|---|
+| T1046 | Network Service Discovery | Nmap service discovery and related probe pattern |
+| T1110.001 | Password Guessing | SSH password-guessing behavior in the attack chain |
+| T1059.004 | Unix Shell | Shell activity after an SSH session is established |
+| T1082 | System Information Discovery | Post-login system-information collection |
+
+The project's Stage 2 service-enumeration label should be reviewed before assigning T1592. A technique mapping should be supported by the specific behavior performed, not copied solely from a code comment.
+
+## Lab environment and safety
+
+- Use Kali Linux and Metasploitable2 in VirtualBox.
+- Connect both VMs to the same **Internal Network**.
+- Keep Metasploitable2 isolated from public, campus, and production networks.
+- Confirm the configured interface names and IP addresses before a run.
+- Use the project only in a lab you own or are explicitly authorized to test.
+- Do not expose the deliberately vulnerable target through a bridged adapter.
+- Treat logs and exported reports as sensitive if they contain account names, credentials, or internal network details.
+
+## Requirements and setup
+
+The project uses Python and the packages listed in `requirements.txt`. The lab also requires Nmap to be installed on Kali. Scapy packet capture may require elevated privileges and the correct interface selection.
+
+Follow the course or repository setup instructions for installing dependencies and starting the dashboard. Before starting a lab run, verify the VM network is isolated and that the configured target address is the intended Metasploitable2 instance.
+
+## Logs and report
+
+The dashboard keeps attack-chain output and detector findings in separate logs and displays them separately. Its print/report view formats the available operation logs for printing or saving as PDF. It should be described as a **log report**, not as an automated incident analysis or remediation system unless those features are implemented in the submitted code.
+
+## Limitations
+
+- The detector uses packet metadata and simple thresholds; its alerts can be incomplete or produce false positives.
+- SSH encryption prevents packet-level inspection of authentication outcomes and command contents.
+- The attack chain and detector provide different evidence; their outputs should not be conflated.
+- The login-timing demo uses synthetic events and does not establish a real user's identity.
+- No precision, recall, false-positive rate, or detection-latency result is claimed without a labelled dataset and measured evaluation runs.
+- This prototype is for instruction and demonstration, not production network monitoring.
+
+## Technology stack
+
+Python, Flask, Nmap (`python-nmap`), Paramiko, Scapy, HTML, CSS, JavaScript, VirtualBox, Kali Linux, and Metasploitable2.
